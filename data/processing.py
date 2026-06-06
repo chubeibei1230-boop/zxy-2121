@@ -153,12 +153,16 @@ def calculate_efficiency_metrics(merged_df, weight_df, period):
     df_period = add_period_columns(merged_df, period)
     weight_period = add_period_columns(weight_df, period)
 
-    feed_agg = df_period.groupby(["period", "period_label", "pen_id", "batch_id"]).agg(
-        total_feed_kg=("total_feed_kg", "sum"),
-        total_records=("total_records", "sum"),
-        anomaly_count=("anomaly_count", "sum"),
-        avg_animal_count=("animal_count", "mean"),
-    ).reset_index()
+    agg_dict = {
+        "total_feed_kg": ("total_feed_kg", "sum"),
+    }
+    if "animal_count" in df_period.columns:
+        agg_dict["avg_animal_count"] = ("animal_count", "mean")
+    if "total_records" in df_period.columns and "anomaly_count" in df_period.columns:
+        agg_dict["total_records"] = ("total_records", "sum")
+        agg_dict["anomaly_count"] = ("anomaly_count", "sum")
+
+    feed_agg = df_period.groupby(["period", "period_label", "pen_id", "batch_id"]).agg(**agg_dict).reset_index()
 
     weight_agg = weight_period.groupby(["period", "period_label", "pen_id", "batch_id"]).agg(
         avg_weight=("weight_kg", "mean"),
@@ -175,8 +179,20 @@ def calculate_efficiency_metrics(merged_df, weight_df, period):
     )
     merged["daily_gain"] = merged["weight_gain"] / merged["days_in_period"]
     merged["feed_per_head"] = merged["total_feed_kg"] / merged["animal_count"].replace(0, 1)
-    merged["fcr"] = merged["total_feed_kg"] / (merged["weight_gain"] * merged["animal_count"]).replace(0, 1)
-    merged["anomaly_ratio"] = merged["anomaly_count"] / merged["total_records"].replace(0, 1) * 100
+
+    merged["fcr"] = merged.apply(
+        lambda row: row["total_feed_kg"] / (row["weight_gain"] * row["animal_count"])
+        if row["weight_gain"] > 0.1 and row["animal_count"] > 0 else None,
+        axis=1
+    )
+
+    if "anomaly_count" in merged.columns and "total_records" in merged.columns:
+        merged["anomaly_ratio"] = merged["anomaly_count"] / merged["total_records"].replace(0, 1) * 100
+    else:
+        merged["anomaly_ratio"] = None
+
+    merged["daily_gain"] = merged["daily_gain"].apply(lambda x: x if x >= -5 else None)
+    merged["fcr"] = merged["fcr"].apply(lambda x: x if (x is not None and 0.1 <= x <= 20) else None)
 
     merged = merged.replace([float("inf"), -float("inf")], None)
     merged = merged.round(3)
@@ -187,23 +203,24 @@ def calculate_efficiency_metrics(merged_df, weight_df, period):
 def calculate_pen_batch_efficiency(merged_df, weight_df, period):
     eff = calculate_efficiency_metrics(merged_df, weight_df, period)
     if eff is None:
-        return None
+        return None, None
 
-    pen_rank = eff.groupby("pen_id").agg(
-        avg_fcr=("fcr", "mean"),
-        avg_daily_gain=("daily_gain", "mean"),
-        avg_anomaly_ratio=("anomaly_ratio", "mean"),
-        total_feed=("total_feed_kg", "sum"),
-        avg_feed_per_head=("feed_per_head", "mean"),
-    ).reset_index()
+    pen_agg = {
+        "avg_fcr": ("fcr", "mean"),
+        "avg_daily_gain": ("daily_gain", "mean"),
+        "total_feed": ("total_feed_kg", "sum"),
+        "avg_feed_per_head": ("feed_per_head", "mean"),
+    }
+    if "anomaly_ratio" in eff.columns and eff["anomaly_ratio"].notna().any():
+        pen_agg["avg_anomaly_ratio"] = ("anomaly_ratio", "mean")
 
-    batch_rank = eff.groupby("batch_id").agg(
-        avg_fcr=("fcr", "mean"),
-        avg_daily_gain=("daily_gain", "mean"),
-        avg_anomaly_ratio=("anomaly_ratio", "mean"),
-        total_feed=("total_feed_kg", "sum"),
-        avg_feed_per_head=("feed_per_head", "mean"),
-    ).reset_index()
+    pen_rank = eff.groupby("pen_id").agg(**pen_agg).reset_index()
+    if "avg_anomaly_ratio" not in pen_rank.columns:
+        pen_rank["avg_anomaly_ratio"] = 0
+
+    batch_rank = eff.groupby("batch_id").agg(**pen_agg).reset_index()
+    if "avg_anomaly_ratio" not in batch_rank.columns:
+        batch_rank["avg_anomaly_ratio"] = 0
 
     return pen_rank.round(3), batch_rank.round(3)
 
@@ -213,13 +230,25 @@ def identify_inefficient_pens(pen_rank, thresholds):
         return None
 
     inefficient = pen_rank.copy()
-    inefficient["fcr_warning"] = inefficient["avg_fcr"] > thresholds["warning_fcr"]
-    inefficient["gain_warning"] = inefficient["avg_daily_gain"] < thresholds["warning_daily_gain"]
-    inefficient["anomaly_warning"] = inefficient["avg_anomaly_ratio"] > thresholds["warning_anomaly_ratio"]
-    inefficient["anomaly_critical"] = inefficient["avg_anomaly_ratio"] > thresholds["critical_anomaly_ratio"]
-    inefficient["warning_count"] = inefficient[["fcr_warning", "gain_warning", "anomaly_warning"]].sum(axis=1)
+    inefficient["fcr_warning"] = inefficient["avg_fcr"].fillna(999) > thresholds["warning_fcr"]
+    inefficient["gain_warning"] = inefficient["avg_daily_gain"].fillna(-999) < thresholds["warning_daily_gain"]
+
+    has_anomaly = "avg_anomaly_ratio" in inefficient.columns and inefficient["avg_anomaly_ratio"].notna().any()
+    if has_anomaly:
+        inefficient["anomaly_warning"] = inefficient["avg_anomaly_ratio"].fillna(0) > thresholds["warning_anomaly_ratio"]
+        inefficient["anomaly_critical"] = inefficient["avg_anomaly_ratio"].fillna(0) > thresholds["critical_anomaly_ratio"]
+    else:
+        inefficient["anomaly_warning"] = False
+        inefficient["anomaly_critical"] = False
+
+    warning_cols = ["fcr_warning", "gain_warning"]
+    if has_anomaly:
+        warning_cols.append("anomaly_warning")
+    inefficient["warning_count"] = inefficient[warning_cols].sum(axis=1)
+
+    max_warnings = len(warning_cols)
     inefficient["risk_level"] = inefficient["warning_count"].apply(
-        lambda x: "🔴 高风险" if x >= 3 else ("🟡 中风险" if x >= 2 else ("🟢 低风险" if x >= 1 else "✅ 正常"))
+        lambda x: "🔴 高风险" if x >= max_warnings else ("🟡 中风险" if x >= max(1, max_warnings - 1) else ("🟢 低风险" if x >= 1 else "✅ 正常"))
     )
     return inefficient.sort_values("warning_count", ascending=False)
 
@@ -232,9 +261,11 @@ def analyze_fluctuation_reasons(eff_df, thresholds):
     latest = eff_df.iloc[-1]
     previous = eff_df.iloc[-2]
 
-    fcr_change = (latest["fcr"] - previous["fcr"]) / previous["fcr"] * 100 if previous["fcr"] else 0
-    gain_change = (latest["daily_gain"] - previous["daily_gain"]) / previous["daily_gain"] * 100 if previous["daily_gain"] else 0
-    anomaly_change = latest["anomaly_ratio"] - previous["anomaly_ratio"]
+    fcr_change = (latest["fcr"] - previous["fcr"]) / previous["fcr"] * 100 if (previous["fcr"] and previous["fcr"] > 0) else 0
+    gain_change = (latest["daily_gain"] - previous["daily_gain"]) / previous["daily_gain"] * 100 if (previous["daily_gain"] and previous["daily_gain"] > 0) else 0
+
+    has_anomaly = "anomaly_ratio" in eff_df.columns and pd.notna(latest["anomaly_ratio"]) and pd.notna(previous["anomaly_ratio"])
+    anomaly_change = latest["anomaly_ratio"] - previous["anomaly_ratio"] if has_anomaly else 0
 
     if abs(fcr_change) > 10:
         if fcr_change > 0:
@@ -268,7 +299,7 @@ def analyze_fluctuation_reasons(eff_df, thresholds):
                 "reason": "日增重明显提升，生长状况良好"
             })
 
-    if anomaly_change > 5:
+    if has_anomaly and anomaly_change > 5:
         reasons.append({
             "type": "danger",
             "metric": "异常占比",
@@ -276,7 +307,7 @@ def analyze_fluctuation_reasons(eff_df, thresholds):
             "reason": "异常占比显著增加，建议立即排查健康问题和环境因素"
         })
 
-    if latest["anomaly_ratio"] > thresholds["critical_anomaly_ratio"]:
+    if has_anomaly and latest["anomaly_ratio"] > thresholds["critical_anomaly_ratio"]:
         reasons.append({
             "type": "danger",
             "metric": "异常占比",
@@ -294,7 +325,10 @@ def build_efficiency_summary(eff_df, pen_rank, thresholds):
     summary = {}
     summary["avg_fcr"] = eff_df["fcr"].mean()
     summary["avg_daily_gain"] = eff_df["daily_gain"].mean()
-    summary["avg_anomaly_ratio"] = eff_df["anomaly_ratio"].mean()
+    if "anomaly_ratio" in eff_df.columns and eff_df["anomaly_ratio"].notna().any():
+        summary["avg_anomaly_ratio"] = eff_df["anomaly_ratio"].mean()
+    else:
+        summary["avg_anomaly_ratio"] = 0
     summary["avg_feed_per_head"] = eff_df["feed_per_head"].mean()
     summary["total_feed"] = eff_df["total_feed_kg"].sum()
     summary["total_weight_gain"] = (eff_df["weight_gain"] * eff_df["animal_count"]).sum()
