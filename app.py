@@ -13,6 +13,7 @@ from ui.components import (
     show_weight_analysis,
     show_anomaly_analysis,
     show_export,
+    show_efficiency_dashboard,
 )
 
 st.set_page_config(**PAGE_CONFIG)
@@ -46,7 +47,7 @@ def main():
 
     show_data_overview(role)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🌾 饲喂分析", "⚖️ 体重分析", "⚠️ 异常分析", "📥 数据导出"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🌾 饲喂分析", "⚖️ 体重分析", "⚠️ 异常分析", "� 效率看板", "�📥 数据导出"])
 
     with tab1:
         if role in ("运营人员", "场长"):
@@ -76,6 +77,13 @@ def main():
             st.info("运营人员无异常分析权限，请切换角色")
 
     with tab4:
+        role_info = ROLE_CONFIG.get(role, {})
+        if role_info.get("can_view_efficiency", False):
+            show_efficiency_dashboard(role, filtered_merged, filtered_weight, period, pen_filter, batch_filter)
+        else:
+            st.info("🔒 仅运营人员和场长可查看饲喂效率看板，请切换角色")
+
+    with tab5:
         show_export(filtered_merged, filtered_weight, health_df, period, pen_filter, batch_filter)
 
 
